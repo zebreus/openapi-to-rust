@@ -203,6 +203,8 @@ pub struct FeaturesSection {
     #[serde(default)]
     pub enable_async_client: bool,
     #[serde(default)]
+    pub enable_reqwless_client: bool,
+    #[serde(default)]
     pub enable_specta: bool,
     /// Generate a static operation registry with metadata for CLI/proxy routing
     #[serde(default)]
@@ -607,6 +609,7 @@ impl ConfigFile {
             module_name: self.generator.module_name,
             enable_sse_client: self.features.enable_sse_client,
             enable_async_client: self.features.enable_async_client,
+            enable_reqwless_client: self.features.enable_reqwless_client,
             enable_specta: self.features.enable_specta,
             type_mappings: if self.type_mappings.is_empty() {
                 super::generator::default_type_mappings()
