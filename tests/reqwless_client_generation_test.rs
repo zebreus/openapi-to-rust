@@ -129,21 +129,24 @@ fn create_minimal_spec() -> serde_json::Value {
 fn test_reqwless_client_struct_generation() {
     let generator = CodeGenerator::new(create_test_config());
     let client_code = generator.generate_reqwless_client_struct();
-    let code_str = client_code.to_string();
+    let syntax_tree = syn::parse2::<syn::File>(client_code).expect("Failed to parse generated code");
+    let code_str = prettyplease::unparse(&syntax_tree);
 
     assert!(code_str.contains("pub struct EmbeddedHttpClient"));
-    assert!(code_str.contains("embedded_nal_async :: TcpConnect"));
-    assert!(code_str.contains("embedded_nal_async :: Dns"));
+    assert!(code_str.contains("embedded_nal_async::TcpConnect"));
+    assert!(code_str.contains("embedded_nal_async::Dns"));
     assert!(code_str.contains("ReqwlessHttpClient"));
     assert!(code_str.contains("rx_buf"));
     assert!(code_str.contains("custom_headers"));
-    assert!(code_str.contains("BTreeMap < String , String >"));
+    assert!(code_str.contains("BTreeMap<String, String>"));
 }
 
 #[test]
 fn test_reqwless_constructor_and_builders() {
     let generator = CodeGenerator::new(create_test_config());
-    let code_str = generator.generate_reqwless_client_struct().to_string();
+    let client_code = generator.generate_reqwless_client_struct();
+    let syntax_tree = syn::parse2::<syn::File>(client_code).expect("Failed to parse generated code");
+    let code_str = prettyplease::unparse(&syntax_tree);
 
     assert!(code_str.contains("pub fn new"));
     assert!(code_str.contains("pub fn with_rx_buf_size"));

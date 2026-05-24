@@ -1460,7 +1460,7 @@ impl CodeGenerator {
             use embedded_io_async::Read;
             use reqwless::client::HttpClient as ReqwlessHttpClient;
             use reqwless::headers::ContentType;
-            use reqwless::request::{Method, RequestBuilder};
+            use reqwless::request::Method;
 
             #error_types
 
@@ -1870,10 +1870,7 @@ impl CodeGenerator {
             other => {
                 let message = format!("reqwless does not support custom HTTP method `{other}`");
                 quote! {
-                    {
-                        let _ = #message;
-                        Method::GET
-                    }
+                    compile_error!(#message)
                 }
             }
         }

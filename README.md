@@ -216,7 +216,7 @@ async fn call_api() {
     let mut client = EmbeddedHttpClient::new("http://api.example.com", &TCP, &DNS)
         .with_api_key("token");
 
-    let _ = client.list_resources(None).await;
+    let _ = client.your_operation(None).await;
 }
 ```
 
