@@ -1518,8 +1518,11 @@ impl CodeGenerator {
         quote! {
             const DEFAULT_RX_BUF_SIZE: usize = 32 * 1024;
 
+            /// Internal response envelope returned by the shared reqwless send helper.
             struct ResponseData {
+                /// Numeric HTTP status code returned by the server.
                 status: u16,
+                /// Raw response body bytes read from the reqwless response stream.
                 body: Vec<u8>,
             }
 
@@ -1528,11 +1531,17 @@ impl CodeGenerator {
                 T: embedded_nal_async::TcpConnect + 'static,
                 D: embedded_nal_async::Dns + 'static,
             > {
+                /// Base URL prepended to generated operation paths.
                 base_url: String,
+                /// Optional API key applied through the configured authentication scheme.
                 api_key: Option<String>,
+                /// Static TCP transport required by reqwless.
                 transport: &'static T,
+                /// Static DNS resolver required by reqwless.
                 dns: &'static D,
+                /// Reusable receive buffer for response headers and buffered body reads.
                 rx_buf: Vec<u8>,
+                /// Additional headers sent with every generated request.
                 custom_headers: BTreeMap<String, String>,
             }
 
@@ -1595,6 +1604,11 @@ impl CodeGenerator {
                     ReqwlessHttpClient::new(self.transport, self.dns)
                 }
 
+                /// Send one HTTP request through reqwless and read the full response body.
+                ///
+                /// The generated operation methods prepare the URL, optional body, content type,
+                /// and borrowed header slice, then this helper performs the transport work and
+                /// returns raw status/body data for typed response parsing.
                 async fn send_request(
                     &mut self,
                     method: Method,
@@ -1604,7 +1618,7 @@ impl CodeGenerator {
                     headers: &[(&str, &str)],
                 ) -> Result<ResponseData, HttpError> {
                     let mut client = self.make_client();
-                    let handle = client
+                    let mut handle = client
                         .request(method, url)
                         .await
                         .map_err(HttpError::connection_error)?
@@ -1628,7 +1642,6 @@ impl CodeGenerator {
                             .to_vec();
                         (status, body)
                     } else {
-                        let mut handle = handle;
                         let response = handle
                             .send(&mut self.rx_buf)
                             .await
@@ -1664,10 +1677,12 @@ impl CodeGenerator {
             }
 
             impl HttpError {
+                /// Convert a reqwless or embedded I/O failure into a transport error.
                 pub fn connection_error(error: impl fmt::Debug) -> Self {
                     Self::Connection(format!("{:?}", error))
                 }
 
+                /// Convert a request serialization failure into a transport-layer error.
                 pub fn serialization_error(error: impl fmt::Display) -> Self {
                     Self::Serialization(error.to_string())
                 }
