@@ -1527,6 +1527,11 @@ impl CodeGenerator {
             }
 
             /// No-std HTTP client for making API requests through embedded-nal-async.
+            ///
+            /// reqwless stores references to the TCP transport and DNS resolver, so both
+            /// arguments must have a `'static` lifetime. In embedded applications this is
+            /// typically satisfied by declaring transport and DNS singletons as `static`
+            /// values and passing references to them into [`EmbeddedHttpClient::new`].
             pub struct EmbeddedHttpClient<
                 T: embedded_nal_async::TcpConnect + 'static,
                 D: embedded_nal_async::Dns + 'static,
@@ -1551,6 +1556,9 @@ impl CodeGenerator {
                 > EmbeddedHttpClient<T, D>
             {
                 /// Create a new no-std HTTP client with the default receive buffer size.
+                ///
+                /// The transport and DNS resolver references must be `'static`; use static
+                /// singletons for platform adapters when constructing the client.
                 pub fn new(
                     base_url: impl Into<String>,
                     transport: &'static T,
@@ -1560,6 +1568,9 @@ impl CodeGenerator {
                 }
 
                 /// Create a new no-std HTTP client with a custom receive buffer size.
+                ///
+                /// The transport and DNS resolver references must be `'static`; use static
+                /// singletons for platform adapters when constructing the client.
                 pub fn with_rx_buf_size(
                     base_url: impl Into<String>,
                     transport: &'static T,
@@ -1624,6 +1635,9 @@ impl CodeGenerator {
                         .map_err(HttpError::connection_error)?
                         .headers(headers);
 
+                    // reqwless's builder changes type once a body is attached, so the
+                    // send/read sequence is kept in each branch instead of trying to
+                    // name one common builder value.
                     let (status, body) = if let Some(body) = body {
                         let mut handle = handle.body(body);
                         if let Some(content_type) = content_type {
@@ -1938,11 +1952,6 @@ impl CodeGenerator {
         for param in query_params {
             let param_name = Self::to_field_ident(&self.param_ident_str(param));
             let param_key = &param.name;
-            let value_expr = if Self::param_uses_as_ref_str(param) {
-                quote! { v.as_ref().to_string() }
-            } else {
-                quote! { v.to_string() }
-            };
 
             if param.required {
                 let value_expr = if Self::param_uses_as_ref_str(param) {
@@ -1958,6 +1967,11 @@ impl CodeGenerator {
                     separator = '&';
                 });
             } else {
+                let value_expr = if Self::param_uses_as_ref_str(param) {
+                    quote! { v.as_ref().to_string() }
+                } else {
+                    quote! { v.to_string() }
+                };
                 query_building.push(quote! {
                     if let Some(v) = #param_name {
                         request_url.push(separator);
@@ -2040,11 +2054,6 @@ impl CodeGenerator {
         for param in header_params {
             let param_ident = Self::to_field_ident(&self.param_ident_str(param));
             let header_name = &param.name;
-            let value_expr = if Self::param_uses_as_ref_str(param) {
-                quote! { v.as_ref().to_string() }
-            } else {
-                quote! { v.to_string() }
-            };
 
             if param.required {
                 let value_expr = if Self::param_uses_as_ref_str(param) {
@@ -2056,6 +2065,11 @@ impl CodeGenerator {
                     header_storage.push((#header_name.to_string(), #value_expr));
                 });
             } else {
+                let value_expr = if Self::param_uses_as_ref_str(param) {
+                    quote! { v.as_ref().to_string() }
+                } else {
+                    quote! { v.to_string() }
+                };
                 header_param_tokens.push(quote! {
                     if let Some(v) = #param_ident {
                         header_storage.push((#header_name.to_string(), #value_expr));
