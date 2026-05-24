@@ -1432,3 +1432,840 @@ impl CodeGenerator {
         }
     }
 }
+
+impl CodeGenerator {
+    /// Generate a no-std async HTTP client backed by reqwless and embedded-nal-async.
+    pub fn generate_reqwless_client(&self, analysis: &SchemaAnalysis) -> crate::Result<String> {
+        let error_types = self.generate_reqwless_error_types();
+        let client_struct = self.generate_reqwless_client_struct();
+        let operation_methods = self.generate_reqwless_operation_methods(analysis);
+
+        let generated = quote! {
+            //! Generated no-std HTTP client for regular API requests.
+            //!
+            //! This client uses reqwless with embedded-nal-async transports.
+            //! Do not edit manually - regenerate using the appropriate script.
+            #![allow(clippy::format_in_format_args)]
+            #![allow(clippy::let_unit_value)]
+
+            extern crate alloc;
+
+            use super::types::*;
+            use alloc::collections::BTreeMap;
+            use alloc::format;
+            use alloc::string::{String, ToString};
+            use alloc::vec;
+            use alloc::vec::Vec;
+            use core::fmt;
+            use embedded_io_async::Read;
+            use reqwless::client::HttpClient as ReqwlessHttpClient;
+            use reqwless::headers::ContentType;
+            use reqwless::request::{Method, RequestBuilder};
+
+            #error_types
+
+            #client_struct
+
+            #operation_methods
+        };
+
+        let syntax_tree = syn::parse2::<syn::File>(generated).map_err(|e| {
+            crate::GeneratorError::CodeGenError(format!(
+                "Failed to parse reqwless HTTP client code: {e}"
+            ))
+        })?;
+
+        Ok(prettyplease::unparse(&syntax_tree))
+    }
+
+    /// Generate the reqwless client struct and shared helpers.
+    pub fn generate_reqwless_client_struct(&self) -> TokenStream {
+        let path_encoder = quote! {
+            fn __pct_encode_path_segment(s: &str) -> String {
+                let mut out = String::with_capacity(s.len());
+                for &b in s.as_bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                            out.push(b as char);
+                        }
+                        _ => {
+                            out.push('%');
+                            out.push_str(&format!("{:02X}", b));
+                        }
+                    }
+                }
+                out
+            }
+
+            fn __pct_encode_query_component(s: &str) -> String {
+                let mut out = String::with_capacity(s.len());
+                for &b in s.as_bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                            out.push(b as char);
+                        }
+                        b' ' => out.push('+'),
+                        _ => {
+                            out.push('%');
+                            out.push_str(&format!("{:02X}", b));
+                        }
+                    }
+                }
+                out
+            }
+        };
+
+        quote! {
+            const DEFAULT_RX_BUF_SIZE: usize = 32 * 1024;
+
+            struct ResponseData {
+                status: u16,
+                body: Vec<u8>,
+            }
+
+            /// No-std HTTP client for making API requests through embedded-nal-async.
+            pub struct EmbeddedHttpClient<
+                T: embedded_nal_async::TcpConnect + 'static,
+                D: embedded_nal_async::Dns + 'static,
+            > {
+                base_url: String,
+                api_key: Option<String>,
+                transport: &'static T,
+                dns: &'static D,
+                rx_buf: Vec<u8>,
+                custom_headers: BTreeMap<String, String>,
+            }
+
+            impl<
+                    T: embedded_nal_async::TcpConnect + 'static,
+                    D: embedded_nal_async::Dns + 'static,
+                > EmbeddedHttpClient<T, D>
+            {
+                /// Create a new no-std HTTP client with the default receive buffer size.
+                pub fn new(
+                    base_url: impl Into<String>,
+                    transport: &'static T,
+                    dns: &'static D,
+                ) -> Self {
+                    Self::with_rx_buf_size(base_url, transport, dns, DEFAULT_RX_BUF_SIZE)
+                }
+
+                /// Create a new no-std HTTP client with a custom receive buffer size.
+                pub fn with_rx_buf_size(
+                    base_url: impl Into<String>,
+                    transport: &'static T,
+                    dns: &'static D,
+                    rx_buf_size: usize,
+                ) -> Self {
+                    Self {
+                        base_url: base_url.into().trim_end_matches('/').to_string(),
+                        api_key: None,
+                        transport,
+                        dns,
+                        rx_buf: vec![0; rx_buf_size],
+                        custom_headers: BTreeMap::new(),
+                    }
+                }
+
+                /// Set the base URL for all requests.
+                pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+                    self.base_url = base_url.into().trim_end_matches('/').to_string();
+                    self
+                }
+
+                /// Set the API key for authentication.
+                pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+                    self.api_key = Some(api_key.into());
+                    self
+                }
+
+                /// Add a custom header to all requests.
+                pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+                    self.custom_headers.insert(name.into(), value.into());
+                    self
+                }
+
+                /// Add multiple custom headers.
+                pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+                    self.custom_headers.extend(headers);
+                    self
+                }
+
+                fn make_client(&self) -> ReqwlessHttpClient<'static, T, D> {
+                    ReqwlessHttpClient::new(self.transport, self.dns)
+                }
+
+                async fn send_request(
+                    &mut self,
+                    method: Method,
+                    url: &str,
+                    body: Option<&[u8]>,
+                    content_type: Option<ContentType>,
+                    headers: &[(&str, &str)],
+                ) -> Result<ResponseData, HttpError> {
+                    let mut client = self.make_client();
+                    let handle = client
+                        .request(method, url)
+                        .await
+                        .map_err(HttpError::connection_error)?
+                        .headers(headers);
+
+                    let (status, body) = if let Some(body) = body {
+                        let mut handle = handle.body(body);
+                        if let Some(content_type) = content_type {
+                            handle = handle.content_type(content_type);
+                        }
+                        let response = handle
+                            .send(&mut self.rx_buf)
+                            .await
+                            .map_err(HttpError::connection_error)?;
+                        let status = response.status.0;
+                        let body = response
+                            .body()
+                            .read_to_end()
+                            .await
+                            .map_err(HttpError::connection_error)?
+                            .to_vec();
+                        (status, body)
+                    } else {
+                        let mut handle = handle;
+                        let response = handle
+                            .send(&mut self.rx_buf)
+                            .await
+                            .map_err(HttpError::connection_error)?;
+                        let status = response.status.0;
+                        let body = response
+                            .body()
+                            .read_to_end()
+                            .await
+                            .map_err(HttpError::connection_error)?
+                            .to_vec();
+                        (status, body)
+                    };
+
+                    Ok(ResponseData { status, body })
+                }
+            }
+
+            #path_encoder
+        }
+    }
+
+    fn generate_reqwless_error_types(&self) -> TokenStream {
+        quote! {
+            /// Transport-level errors for the reqwless client.
+            #[derive(Debug, Clone)]
+            pub enum HttpError {
+                Connection(String),
+                Serialization(String),
+                Auth(String),
+                Config(String),
+                Other(String),
+            }
+
+            impl HttpError {
+                pub fn connection_error(error: impl fmt::Debug) -> Self {
+                    Self::Connection(format!("{:?}", error))
+                }
+
+                pub fn serialization_error(error: impl fmt::Display) -> Self {
+                    Self::Serialization(error.to_string())
+                }
+
+                pub fn is_retryable(&self) -> bool {
+                    matches!(self, Self::Connection(_))
+                }
+            }
+
+            impl fmt::Display for HttpError {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    match self {
+                        Self::Connection(message) => write!(f, "connection error: {}", message),
+                        Self::Serialization(message) => write!(f, "serialization error: {}", message),
+                        Self::Auth(message) => write!(f, "authentication error: {}", message),
+                        Self::Config(message) => write!(f, "configuration error: {}", message),
+                        Self::Other(message) => f.write_str(message),
+                    }
+                }
+            }
+
+            /// Envelope returned for any HTTP response that was not a typed success.
+            #[derive(Debug, Clone)]
+            pub struct ApiError<E> {
+                pub status: u16,
+                pub body: Vec<u8>,
+                pub typed: Option<E>,
+                pub parse_error: Option<String>,
+            }
+
+            impl<E> ApiError<E> {
+                pub fn is_client_error(&self) -> bool {
+                    (400..500).contains(&self.status)
+                }
+
+                pub fn is_server_error(&self) -> bool {
+                    (500..600).contains(&self.status)
+                }
+
+                pub fn is_retryable(&self) -> bool {
+                    matches!(self.status, 429 | 500 | 502 | 503 | 504)
+                }
+            }
+
+            impl<E: fmt::Debug> fmt::Display for ApiError<E> {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "API error {}: ", self.status)?;
+                    match core::str::from_utf8(&self.body) {
+                        Ok(body) => f.write_str(body),
+                        Err(_) => write!(f, "{} response bytes", self.body.len()),
+                    }
+                }
+            }
+
+            /// Result error type returned by every generated operation method.
+            #[derive(Debug, Clone)]
+            pub enum ApiOpError<E: fmt::Debug> {
+                Transport(HttpError),
+                Api(ApiError<E>),
+            }
+
+            impl<E: fmt::Debug> ApiOpError<E> {
+                pub fn api(&self) -> Option<&ApiError<E>> {
+                    match self {
+                        Self::Api(e) => Some(e),
+                        Self::Transport(_) => None,
+                    }
+                }
+
+                pub fn is_api_error(&self) -> bool {
+                    matches!(self, Self::Api(_))
+                }
+            }
+
+            impl<E: fmt::Debug> From<HttpError> for ApiOpError<E> {
+                fn from(e: HttpError) -> Self {
+                    Self::Transport(e)
+                }
+            }
+
+            impl<E: fmt::Debug> fmt::Display for ApiOpError<E> {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    match self {
+                        Self::Transport(error) => fmt::Display::fmt(error, f),
+                        Self::Api(error) => fmt::Display::fmt(error, f),
+                    }
+                }
+            }
+
+            pub type HttpResult<T> = Result<T, HttpError>;
+        }
+    }
+
+    fn generate_reqwless_operation_methods(&self, analysis: &SchemaAnalysis) -> TokenStream {
+        let param_enums = self.generate_param_enum_types(analysis);
+
+        let op_error_enums: Vec<TokenStream> = analysis
+            .operations
+            .values()
+            .filter_map(|op| self.generate_op_error_enum(op))
+            .collect();
+
+        let methods: Vec<TokenStream> = analysis
+            .operations
+            .values()
+            .map(|op| self.generate_single_reqwless_operation_method(op))
+            .collect();
+
+        quote! {
+            #param_enums
+
+            #(#op_error_enums)*
+
+            impl<
+                    T: embedded_nal_async::TcpConnect + 'static,
+                    D: embedded_nal_async::Dns + 'static,
+                > EmbeddedHttpClient<T, D>
+            {
+                #(#methods)*
+            }
+        }
+    }
+
+    fn generate_single_reqwless_operation_method(&self, op: &OperationInfo) -> TokenStream {
+        let method_name = self.get_method_name(op);
+        let method = self.reqwless_method_token(op);
+        let request_param = self.generate_reqwless_request_param(op);
+        let url_construction = self.generate_reqwless_url_construction(&op.path, op);
+        let header_storage = self.generate_reqwless_header_storage(op);
+        let request_body = self.generate_reqwless_request_body(op);
+        let response_type = self.get_response_type(op);
+        let has_response_body = self.get_success_response_schema(op).is_some();
+        let op_error_type = self.op_error_type_token(op);
+        let response_handling = self.generate_reqwless_response_handling(op, has_response_body);
+        let doc_comment = self.generate_operation_doc_comment(op);
+
+        quote! {
+            #doc_comment
+            pub async fn #method_name(
+                &mut self,
+                #request_param
+            ) -> Result<#response_type, ApiOpError<#op_error_type>> {
+                #url_construction
+                #header_storage
+                #request_body
+
+                let headers: Vec<(&str, &str)> = header_storage
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                let response = self
+                    .send_request(#method, &request_url, request_body.as_deref(), content_type, &headers)
+                    .await?;
+
+                #response_handling
+            }
+        }
+    }
+
+    fn reqwless_method_token(&self, op: &OperationInfo) -> TokenStream {
+        match op.method.to_uppercase().as_str() {
+            "GET" => quote! { Method::GET },
+            "POST" => quote! { Method::POST },
+            "PUT" => quote! { Method::PUT },
+            "DELETE" => quote! { Method::DELETE },
+            "PATCH" => quote! { Method::PATCH },
+            "HEAD" => quote! { Method::HEAD },
+            "OPTIONS" => quote! { Method::OPTIONS },
+            "TRACE" => quote! { Method::TRACE },
+            "CONNECT" => quote! { Method::CONNECT },
+            other => {
+                let message = format!("reqwless does not support custom HTTP method `{other}`");
+                quote! {
+                    {
+                        let _ = #message;
+                        Method::GET
+                    }
+                }
+            }
+        }
+    }
+
+    fn generate_reqwless_request_param(&self, op: &OperationInfo) -> TokenStream {
+        let mut params = Vec::new();
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unique_param_ident = |raw: String| -> syn::Ident {
+            let mut chosen = raw.clone();
+            let mut suffix = 2;
+            while !used.insert(chosen.clone()) {
+                chosen = format!("{raw}_{suffix}");
+                suffix += 1;
+            }
+            Self::to_field_ident(&chosen)
+        };
+
+        for location in ["path", "query", "header"] {
+            for param in &op.parameters {
+                if param.location == location {
+                    let param_name = unique_param_ident(self.param_ident_str(param));
+                    let param_type = self.get_param_rust_type(param);
+                    if location == "path" || param.required {
+                        params.push(quote! { #param_name: #param_type });
+                    } else {
+                        params.push(quote! { #param_name: Option<#param_type> });
+                    }
+                }
+            }
+        }
+
+        if let Some(ref rb) = op.request_body {
+            use crate::analysis::RequestBodyContent;
+            let required = op.request_body_required;
+            let body_type = match rb {
+                RequestBodyContent::Json { schema_name }
+                | RequestBodyContent::FormUrlEncoded { schema_name } => {
+                    let rust_type_name = self.to_rust_type_name(schema_name);
+                    let request_ident =
+                        syn::Ident::new(&rust_type_name, proc_macro2::Span::call_site());
+                    quote! { #request_ident }
+                }
+                RequestBodyContent::Multipart => quote! { Vec<u8> },
+                RequestBodyContent::OctetStream => quote! { Vec<u8> },
+                RequestBodyContent::TextPlain => quote! { String },
+            };
+            let body_ident = match rb {
+                RequestBodyContent::Multipart => quote! { form },
+                RequestBodyContent::OctetStream | RequestBodyContent::TextPlain => quote! { body },
+                _ => quote! { request },
+            };
+            if required {
+                params.push(quote! { #body_ident: #body_type });
+            } else {
+                params.push(quote! { #body_ident: Option<#body_type> });
+            }
+        }
+
+        if params.is_empty() {
+            quote! {}
+        } else {
+            quote! { #(#params),* }
+        }
+    }
+
+    fn generate_reqwless_url_construction(&self, path: &str, op: &OperationInfo) -> TokenStream {
+        let path_tokens = self.generate_url_with_params(path, op);
+        let query_params: Vec<_> = op
+            .parameters
+            .iter()
+            .filter(|p| p.location == "query")
+            .collect();
+
+        let mut query_building = Vec::new();
+        for param in query_params {
+            let param_name = Self::to_field_ident(&self.param_ident_str(param));
+            let param_key = &param.name;
+            let value_expr = if Self::param_uses_as_ref_str(param) {
+                quote! { v.as_ref().to_string() }
+            } else {
+                quote! { v.to_string() }
+            };
+
+            if param.required {
+                let value_expr = if Self::param_uses_as_ref_str(param) {
+                    quote! { #param_name.as_ref().to_string() }
+                } else {
+                    quote! { #param_name.to_string() }
+                };
+                query_building.push(quote! {
+                    request_url.push(separator);
+                    request_url.push_str(#param_key);
+                    request_url.push('=');
+                    request_url.push_str(&__pct_encode_query_component(&#value_expr));
+                    separator = '&';
+                });
+            } else {
+                query_building.push(quote! {
+                    if let Some(v) = #param_name {
+                        request_url.push(separator);
+                        request_url.push_str(#param_key);
+                        request_url.push('=');
+                        request_url.push_str(&__pct_encode_query_component(&#value_expr));
+                        separator = '&';
+                    }
+                });
+            }
+        }
+
+        if query_building.is_empty() {
+            quote! {
+                #path_tokens
+            }
+        } else {
+            quote! {
+                #path_tokens
+                let mut request_url = request_url;
+                let mut separator = if request_url.contains('?') { '&' } else { '?' };
+                #(#query_building)*
+                let _ = separator;
+            }
+        }
+    }
+
+    fn generate_reqwless_header_storage(&self, op: &OperationInfo) -> TokenStream {
+        let auth_application = match &self.config().auth_config {
+            Some(crate::http_config::AuthConfig::Bearer { header_name }) => {
+                let h = header_name.clone();
+                quote! {
+                    if let Some(api_key) = &self.api_key {
+                        header_storage.push((#h.to_string(), format!("{} {}", "Bearer", api_key)));
+                    }
+                }
+            }
+            Some(crate::http_config::AuthConfig::ApiKey { header_name }) => {
+                let h = header_name.clone();
+                quote! {
+                    if let Some(api_key) = &self.api_key {
+                        header_storage.push((#h.to_string(), api_key.clone()));
+                    }
+                }
+            }
+            Some(crate::http_config::AuthConfig::Custom {
+                header_name,
+                header_value_prefix,
+            }) => {
+                let h = header_name.clone();
+                let prefix = header_value_prefix.clone().unwrap_or_default();
+                if prefix.is_empty() {
+                    quote! {
+                        if let Some(api_key) = &self.api_key {
+                            header_storage.push((#h.to_string(), api_key.clone()));
+                        }
+                    }
+                } else {
+                    let format_str = format!("{}{{}}", prefix);
+                    quote! {
+                        if let Some(api_key) = &self.api_key {
+                            header_storage.push((#h.to_string(), format!(#format_str, api_key)));
+                        }
+                    }
+                }
+            }
+            None => quote! {
+                if let Some(api_key) = &self.api_key {
+                    header_storage.push(("Authorization".to_string(), format!("{} {}", "Bearer", api_key)));
+                }
+            },
+        };
+
+        let header_params: Vec<_> = op
+            .parameters
+            .iter()
+            .filter(|p| p.location == "header")
+            .collect();
+        let mut header_param_tokens = Vec::new();
+        for param in header_params {
+            let param_ident = Self::to_field_ident(&self.param_ident_str(param));
+            let header_name = &param.name;
+            let value_expr = if Self::param_uses_as_ref_str(param) {
+                quote! { v.as_ref().to_string() }
+            } else {
+                quote! { v.to_string() }
+            };
+
+            if param.required {
+                let value_expr = if Self::param_uses_as_ref_str(param) {
+                    quote! { #param_ident.as_ref().to_string() }
+                } else {
+                    quote! { #param_ident.to_string() }
+                };
+                header_param_tokens.push(quote! {
+                    header_storage.push((#header_name.to_string(), #value_expr));
+                });
+            } else {
+                header_param_tokens.push(quote! {
+                    if let Some(v) = #param_ident {
+                        header_storage.push((#header_name.to_string(), #value_expr));
+                    }
+                });
+            }
+        }
+
+        quote! {
+            let mut header_storage: Vec<(String, String)> = Vec::new();
+            #auth_application
+            for (name, value) in &self.custom_headers {
+                header_storage.push((name.clone(), value.clone()));
+            }
+            #(#header_param_tokens)*
+        }
+    }
+
+    fn generate_reqwless_request_body(&self, op: &OperationInfo) -> TokenStream {
+        let Some(rb) = op.request_body.as_ref() else {
+            return quote! {
+                let request_body: Option<Vec<u8>> = None;
+                let content_type: Option<ContentType> = None;
+            };
+        };
+
+        use crate::analysis::RequestBodyContent;
+        let required = op.request_body_required;
+
+        match rb {
+            RequestBodyContent::Json { .. } => {
+                if required {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = Some(
+                            serde_json::to_vec(&request).map_err(HttpError::serialization_error)?
+                        );
+                        let content_type: Option<ContentType> = Some(ContentType::ApplicationJson);
+                    }
+                } else {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = request
+                            .as_ref()
+                            .map(serde_json::to_vec)
+                            .transpose()
+                            .map_err(HttpError::serialization_error)?;
+                        let content_type: Option<ContentType> = request_body
+                            .as_ref()
+                            .map(|_| ContentType::ApplicationJson);
+                    }
+                }
+            }
+            RequestBodyContent::OctetStream => {
+                if required {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = Some(body);
+                        let content_type: Option<ContentType> = Some(ContentType::ApplicationOctetStream);
+                    }
+                } else {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = body;
+                        let content_type: Option<ContentType> = request_body
+                            .as_ref()
+                            .map(|_| ContentType::ApplicationOctetStream);
+                    }
+                }
+            }
+            RequestBodyContent::TextPlain => {
+                if required {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = Some(body.into_bytes());
+                        let content_type: Option<ContentType> = Some(ContentType::TextPlain);
+                    }
+                } else {
+                    quote! {
+                        let request_body: Option<Vec<u8>> = body.map(String::into_bytes);
+                        let content_type: Option<ContentType> = request_body
+                            .as_ref()
+                            .map(|_| ContentType::TextPlain);
+                    }
+                }
+            }
+            RequestBodyContent::FormUrlEncoded { .. } => {
+                let unsupported = "application/x-www-form-urlencoded request bodies are not supported by the reqwless client";
+                quote! {
+                    let _ = request;
+                    return Err(ApiOpError::Transport(HttpError::Serialization(#unsupported.to_string())));
+                }
+            }
+            RequestBodyContent::Multipart => {
+                let unsupported =
+                    "multipart request bodies are not supported by the reqwless client";
+                quote! {
+                    let _ = form;
+                    return Err(ApiOpError::Transport(HttpError::Serialization(#unsupported.to_string())));
+                }
+            }
+        }
+    }
+
+    fn generate_reqwless_response_handling(
+        &self,
+        op: &OperationInfo,
+        has_response_body: bool,
+    ) -> TokenStream {
+        let op_error_type = self.op_error_type_token(op);
+        let success_branch = if has_response_body {
+            quote! {
+                match serde_json::from_slice(&body) {
+                    Ok(body) => Ok(body),
+                    Err(e) => Err(ApiOpError::Api(ApiError {
+                        status,
+                        body,
+                        typed: None,
+                        parse_error: Some(format!(
+                            "failed to deserialize 2xx response body: {}",
+                            e
+                        )),
+                    })),
+                }
+            }
+        } else {
+            quote! {
+                let _ = body;
+                Ok(())
+            }
+        };
+
+        let error_match_arms = self.generate_reqwless_error_match_arms(op);
+
+        quote! {
+            let status = response.status;
+            let body = response.body;
+
+            if (200..300).contains(&status) {
+                #success_branch
+            } else {
+                let typed: Option<#op_error_type>;
+                let parse_error: Option<String>;
+                #error_match_arms
+                Err(ApiOpError::Api(ApiError {
+                    status,
+                    body,
+                    typed,
+                    parse_error,
+                }))
+            }
+        }
+    }
+
+    fn generate_reqwless_error_match_arms(&self, op: &OperationInfo) -> TokenStream {
+        let arms: Vec<TokenStream> = op
+            .response_schemas
+            .iter()
+            .filter(|(code, _)| !code.starts_with('2'))
+            .filter_map(|(code, schema)| {
+                let variant_ident = Self::op_error_variant_ident(code);
+                let payload_ty_name = self.to_rust_type_name(schema);
+                let payload_ty = syn::Ident::new(&payload_ty_name, proc_macro2::Span::call_site());
+                let enum_ident = self.op_error_enum_ident(op);
+
+                let pattern = match code.as_str() {
+                    "default" | "Default" => return None,
+                    other if other.chars().all(|c| c.is_ascii_digit()) => {
+                        let n: u16 = other.parse().ok()?;
+                        quote! { #n }
+                    }
+                    "1XX" | "1xx" => quote! { code if (100..=199).contains(&code) },
+                    "2XX" | "2xx" => quote! { code if (200..=299).contains(&code) },
+                    "3XX" | "3xx" => quote! { code if (300..=399).contains(&code) },
+                    "4XX" | "4xx" => quote! { code if (400..=499).contains(&code) },
+                    "5XX" | "5xx" => quote! { code if (500..=599).contains(&code) },
+                    _ => return None,
+                };
+
+                Some(quote! {
+                    #pattern => {
+                        match serde_json::from_slice::<#payload_ty>(&body) {
+                            Ok(v) => {
+                                typed = Some(#enum_ident::#variant_ident(v));
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let has_typed_enum = op
+            .response_schemas
+            .iter()
+            .any(|(code, _)| !code.starts_with('2'));
+
+        let default_arm = if has_typed_enum {
+            quote! {
+                _ => {
+                    typed = None;
+                    parse_error = None;
+                }
+            }
+        } else {
+            quote! {
+                _ => {
+                    match serde_json::from_slice::<serde_json::Value>(&body) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+        };
+
+        quote! {
+            match status {
+                #(#arms)*
+                #default_arm
+            }
+        }
+    }
+}

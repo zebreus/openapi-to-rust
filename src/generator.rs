@@ -112,6 +112,8 @@ pub struct GeneratorConfig {
     pub enable_sse_client: bool,
     /// Enable async HTTP client generation
     pub enable_async_client: bool,
+    /// Enable no-std async HTTP client generation using reqwless
+    pub enable_reqwless_client: bool,
     /// Enable Specta type derives for frontend integration
     pub enable_specta: bool,
     /// Custom type mappings
@@ -160,6 +162,7 @@ impl Default for GeneratorConfig {
             module_name: "api_types".to_string(),
             enable_sse_client: true,
             enable_async_client: true,
+            enable_reqwless_client: false,
             enable_specta: false,
             type_mappings: default_type_mappings(),
             streaming_config: None,
@@ -254,6 +257,14 @@ impl CodeGenerator {
                 let http_content = self.generate_http_client(analysis)?;
                 files.push(GeneratedFile {
                     path: "client.rs".into(),
+                    content: http_content,
+                });
+            }
+
+            if self.config.enable_reqwless_client {
+                let http_content = self.generate_reqwless_client(analysis)?;
+                files.push(GeneratedFile {
+                    path: "reqwless_client.rs".into(),
                     content: http_content,
                 });
             }

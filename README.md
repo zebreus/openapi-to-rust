@@ -27,7 +27,7 @@ See the [full release notes](#release-notes) at the bottom of this README for th
 - **OpenAPI 3.1 first, 3.2 experimental** — handles `type: ["X", "null"]`, `anyOf`/`oneOf`/`allOf`, discriminated unions, `const`, inline objects, and accepts paths-less specs (components-only or webhooks-only).
 - **Generates clients *and* servers** — pick what you want via `[features]` and `[server]`. Both share the same `types.rs`.
 - **Typed scalars** — `format: date-time` → `chrono::DateTime<chrono::Utc>`, `uri` → `url::Url`, `binary` → `bytes::Bytes`, `uuid` → `uuid::Uuid`, `byte` → `Vec<u8>` + base64 codec, unsigned-int formats → `u32`/`u64`. All opt-out per-format in TOML.
-- **Async HTTP client** — typed methods per operation, retry/backoff via `reqwest-retry`, distributed tracing via `reqwest-tracing`, Bearer / API-key / custom auth (honored at runtime), default headers, path-template percent-encoding.
+- **Async HTTP clients** — a `reqwest` client for std targets and an opt-in `reqwless` + `embedded-nal-async` client for no-std transports, both with typed methods per operation, auth headers, path/query percent-encoding, and typed API errors.
 - **Axum server scaffolding** — trait per tag, status-code-typed response enum, SSE-ready `OkStream` variant, required-param HTTP 400 short-circuit at the handler boundary, combined `build_router(...)` factory for multi-tag selections.
 - **SSE streaming clients** — first-class Server-Sent Events with reconnection.
 - **Smart discriminated unions** — auto-detects implicit discriminators from `const` properties, falls back to `#[serde(untagged)]` when a union mixes scalar and object branches (e.g. `"auto"` *or* a tagged object).
@@ -74,6 +74,14 @@ max_retries = 3
 [http_client.auth]
 type = "Bearer"
 header_name = "Authorization"
+```
+
+For embedded/no-std transports, enable the reqwless client instead:
+
+```toml
+[features]
+enable_async_client = false
+enable_reqwless_client = true
 ```
 
 Then:
@@ -166,6 +174,7 @@ Two complete examples are in the repo:
 |------|-------------|
 | `types.rs` | All struct/enum definitions from OpenAPI schemas |
 | `client.rs` | Async HTTP client with typed methods per operation (when `enable_async_client`) |
+| `reqwless_client.rs` | No-std async client using `reqwless` and `embedded-nal-async` (when `enable_reqwless_client`) |
 | `streaming.rs` | SSE streaming **client** with event parsing (when configured) |
 | `server/mod.rs` | Module re-exports for the server (when `[server]` is set) |
 | `server/api.rs` | `trait <Tag>Api { async fn <op>(&self, …) -> <Op>Response; }` per tag |
@@ -189,6 +198,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let req = CreateResourceRequest { /* … */ };
     let resource = client.create_resource(req).await?;
     Ok(())
+}
+```
+
+### Generated reqwless client usage
+
+The reqwless client is generic over static `embedded_nal_async::TcpConnect` and
+`embedded_nal_async::Dns` implementations:
+
+```rust
+use crate::generated::reqwless_client::EmbeddedHttpClient;
+
+static TCP: MyTcp = MyTcp;
+static DNS: MyDns = MyDns;
+
+async fn call_api() {
+    let mut client = EmbeddedHttpClient::new("http://api.example.com", &TCP, &DNS)
+        .with_api_key("token");
+
+    let _ = client.list_resources(None).await;
 }
 ```
 
@@ -455,6 +483,7 @@ schema_extensions = []                  # optional list of JSON/YAML overlays me
 [features]
 enable_sse_client = false               # generate SSE streaming client (requires [[streaming.endpoints]])
 enable_async_client = true              # generate HTTP REST client
+enable_reqwless_client = false          # generate no-std reqwless/embedded-nal-async REST client
 enable_specta = false                   # add specta::Type derives
 enable_registry = false                 # generate static operation registry (CLI/proxy routing)
 registry_only = false                   # only generate the registry (skip types/client/streaming)

@@ -269,6 +269,7 @@ pub fn run_generation_test(
             .as_ref()
             .and_then(|o| o.enable_async_client)
             .unwrap_or(false),
+        enable_reqwless_client: false,
         enable_specta: false,
         type_mappings: {
             let mut mappings = std::collections::BTreeMap::new();
